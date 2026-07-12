@@ -222,6 +222,13 @@ setup() {
     if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && [ "${KBS_INGRESS}" = "aks" ]; then
         skip "skip this specific one due to issue https://github.com/kata-containers/kata-containers/issues/10299"
     fi
+    # qemu-coco-dev (Go runtime) pins ~4GB per VM with static_sandbox_resource_mgmt;
+    # microk8s leaves too little host headroom on the free runners and QEMU is
+    # OOM-killed at launch (ttrpc: closed / signal: killed). The same test passes
+    # with qemu-coco-dev-runtime-rs on microk8s and with qemu-coco-dev on k3s/rke2/k0s.
+    if [[ "${KUBERNETES:-}" == "microk8s" ]] && [[ "${KATA_HYPERVISOR}" == "qemu-coco-dev" ]]; then
+        skip "large guest-pull OOMs qemu-coco-dev on microk8s free runners"
+    fi
     storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXXXXX.yaml")
     local_device=$(create_loop_device)
     PV_NAME=trusted-block-pv PVC_NAME=trusted-pvc \
