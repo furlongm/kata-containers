@@ -94,9 +94,9 @@ pub fn k3s_rke2_containerd_template_path(use_v3: bool) -> &'static str {
     }
 }
 
-/// Returns the containerd CRI plugin ID for K3s/RKE2 (section key we write under).
-/// Config v3 uses "io.containerd.cri.v1.runtime", v2 uses "io.containerd.grpc.v1.cri".
-pub fn k3s_rke2_containerd_plugin_id(use_v3: bool) -> &'static str {
+/// Returns the containerd CRI plugin ID (section key we write runtime config under).
+/// Config v3 (split CRI) uses "io.containerd.cri.v1.runtime", v2 uses "io.containerd.grpc.v1.cri".
+pub fn containerd_cri_plugin_id(use_v3: bool) -> &'static str {
     if use_v3 {
         "\"io.containerd.cri.v1.runtime\""
     } else {
@@ -663,36 +663,81 @@ impl Config {
     pub async fn get_containerd_paths(&self, runtime: &str) -> Result<ContainerdPaths> {
         use crate::runtime::manager;
 
-        // Get containerd version once for drop-in and conf.d capability checks.
-        // Not required for k0s (drop-ins are always supported there).
-        let container_runtime_version = if matches!(runtime, "k0s-worker" | "k0s-controller") {
-            None
-        } else {
-            Some(k8s::get_container_runtime_version(self).await?)
-        };
+        // Get containerd version once for drop-in/conf.d capability checks and
+        // effective CRI plugin layout selection.
+        let container_runtime_version = Some(k8s::get_container_runtime_version(self).await?);
         let use_drop_in = manager::is_containerd_capable_of_drop_in(
             runtime,
             container_runtime_version.as_deref(),
         );
 
+        // The config file's declared schema version is not always the same as the
+        // CRI plugin layout containerd uses after loading it. Some distributions
+        // ship a `version = 2` config with a containerd 2.x binary and rely on
+        // containerd's built-in migration to split CRI plugins.
+        let effective_use_v3 = |config_file: &str| -> bool {
+            let config_uses_v3 = fs::read_to_string(config_file)
+                .ok()
+                .and_then(|content| crate::utils::major_version_from_config_toml(&content))
+                .map(|version| version >= 3)
+                .unwrap_or(false);
+            let runtime_uses_v3 = container_runtime_version
+                .as_deref()
+                .map(manager::containerd_version_is_2_or_newer)
+                .unwrap_or(false);
+
+            config_uses_v3 || runtime_uses_v3
+        };
+
         let paths = match runtime {
-            "k0s-worker" | "k0s-controller" => ContainerdPaths {
-                config_file: "/etc/containerd/containerd.toml".to_string(),
-                backup_file: "/etc/containerd/containerd.toml.bak".to_string(), // Never used, but needed for consistency
-                imports_file: None, // k0s auto-loads from containerd.d/, imports not needed
-                drop_in_file: "/etc/containerd/containerd.d/kata-deploy.toml".to_string(),
-                use_drop_in,
-                plugin_id: None,
-            },
-            "microk8s" => ContainerdPaths {
-                // microk8s uses containerd-template.toml instead of config.toml
-                config_file: "/etc/containerd/containerd-template.toml".to_string(),
-                backup_file: "/etc/containerd/containerd-template.toml.bak".to_string(),
-                imports_file: Some("/etc/containerd/containerd-template.toml".to_string()),
-                drop_in_file: self.containerd_drop_in_conf_file.clone(),
-                use_drop_in,
-                plugin_id: None,
-            },
+            "k0s-worker" | "k0s-controller" => {
+                let config_file = "/etc/containerd/containerd.toml".to_string();
+                ContainerdPaths {
+                    config_file: config_file.clone(),
+                    backup_file: "/etc/containerd/containerd.toml.bak".to_string(), // Never used, but needed for consistency
+                    imports_file: None, // k0s auto-loads from containerd.d/, imports not needed
+                    drop_in_file: "/etc/containerd/containerd.d/kata-deploy.toml".to_string(),
+                    use_drop_in,
+                    plugin_id: Some(
+                        containerd_cri_plugin_id(effective_use_v3(&config_file)).to_string(),
+                    ),
+                }
+            }
+            "microk8s" => {
+                // microk8s uses containerd-template.toml instead of config.toml.
+                //
+                // Crucially, microk8s ships a `version = 2` containerd-template.toml
+                // (with the legacy `io.containerd.grpc.v1.cri` plugin) even when it
+                // bundles containerd 2.x (e.g. microk8s 1.35 ships containerd 2.1.3),
+                // relying on containerd's built-in auto-migration to the split CRI
+                // plugins at load time. The template's declared schema version is
+                // therefore an unreliable signal for choosing the v2 vs v3 config
+                // layout.
+                //
+                // This matters for guest-pull: on containerd 2.x the CRI plugin is
+                // split into io.containerd.cri.v1.runtime and io.containerd.cri.v1.images,
+                // and the images plugin needs runtime_platforms.<handler>.snapshotter to
+                // select the per-runtime snapshotter (e.g. nydus) at PullImage time.
+                // Setting only the v2-style per-runtime snapshotter (which is all we do
+                // when we think the config is v2) leaves image pulls on the default
+                // snapshotter, so nydus/guest-pull never engages and containerd tries to
+                // unpack layers on the host (failing on encrypted layers with
+                // "ctd-decoder ... not found").
+                //
+                // So key the layout off the actual containerd binary version instead of
+                // the template's declared schema version, the same way K3s/RKE2 fall
+                // back to the node's containerRuntimeVersion.
+                let config_file = "/etc/containerd/containerd-template.toml".to_string();
+                let use_v3 = effective_use_v3(&config_file);
+                ContainerdPaths {
+                    config_file,
+                    backup_file: "/etc/containerd/containerd-template.toml.bak".to_string(),
+                    imports_file: Some("/etc/containerd/containerd-template.toml".to_string()),
+                    drop_in_file: self.containerd_drop_in_conf_file.clone(),
+                    use_drop_in,
+                    plugin_id: Some(containerd_cri_plugin_id(use_v3).to_string()),
+                }
+            }
             "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server" => {
                 // K3s/RKE2: we only use drop-in when the rendered config already imports the
                 // versioned drop-in dir (config.toml.d or config-v3.toml.d). If the import is
@@ -736,7 +781,7 @@ impl Config {
                     imports_file: None, // we do not modify the template; import is already there
                     drop_in_file,
                     use_drop_in: true,
-                    plugin_id: Some(k3s_rke2_containerd_plugin_id(use_v3).to_string()),
+                    plugin_id: Some(containerd_cri_plugin_id(use_v3).to_string()),
                 }
             }
             _ => {
