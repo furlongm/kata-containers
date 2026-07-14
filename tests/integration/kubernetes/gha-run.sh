@@ -200,9 +200,13 @@ function deploy_kata() {
 		EXPERIMENTAL_FORCE_GUEST_PULL=false
 	fi
 
-	if [[ "${KATA_HYPERVISOR}" == "qemu-nvidia-gpu-runtime-rs" ]] && [[ -z "${SNAPSHOTTER}" ]]; then
-		SNAPSHOTTER="erofs"
-	fi
+	case "${KATA_HYPERVISOR}" in
+		qemu-nvidia-cpu-runtime-rs|qemu-nvidia-gpu-runtime-rs)
+			if [[ -z "${SNAPSHOTTER}" ]]; then
+				SNAPSHOTTER="erofs"
+			fi
+			;;
+	esac
 
 	ANNOTATIONS="default_vcpus"
 	if [[ "${KATA_HYPERVISOR}" == *azure* ]]; then

@@ -881,7 +881,7 @@ function helm_helper() {
 			HELM_CONTAINERD_USER_DROP_IN+="  default_size = \"${erofs_default_size}\""
 
 			# NVIDIA CI hosts are not configured with ext4 fs-verity support.
-			if [[ "${KATA_HYPERVISOR:-}" == *"nvidia-gpu"* ]]; then
+			if [[ "${KATA_HYPERVISOR:-}" == *"nvidia-cpu"* || "${KATA_HYPERVISOR:-}" == *"nvidia-gpu"* ]]; then
 				HELM_CONTAINERD_USER_DROP_IN+=$'\n'"  enable_fsverity = false"
 			fi
 
